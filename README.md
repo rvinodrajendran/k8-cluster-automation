@@ -189,7 +189,7 @@ sudo apt install -y git
 Clone the repository:
 
 ```bash
-git clone git@github.com:rvinodrajendran/k8-cluster-automation.git
+git clone https://github.com/rvinodrajendran/k8-cluster-automation.git
 ```
 
 Enter the project:
