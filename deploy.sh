@@ -7,6 +7,22 @@ echo " Kubernetes Cluster Automation"
 echo "=========================================="
 echo
 
+echo "Checking Ansible installation..."
+
+if ! command -v ansible >/dev/null 2>&1; then
+    echo "Ansible is not installed."
+    echo "Installing Ansible..."
+    sudo apt update
+    sudo apt install -y ansible
+else
+    echo "Ansible is already installed."
+fi
+
+echo
+echo "Ansible version:"
+ansible --version | head -n 1
+
+echo
 read -p "Enter master1 private IP: " MASTER_IP
 read -p "Enter client1 private IP: " CLIENT1_IP
 read -p "Enter client2 private IP: " CLIENT2_IP
@@ -49,3 +65,19 @@ echo
 echo "=========================================="
 echo " Connectivity Successful!"
 echo "=========================================="
+
+echo
+echo "=========================================="
+echo " Starting Kubernetes Deployment"
+echo "=========================================="
+echo
+
+ansible-playbook site.yml
+
+echo
+echo "=========================================="
+echo " Kubernetes Cluster Status"
+echo "=========================================="
+echo
+
+kubectl get nodes
