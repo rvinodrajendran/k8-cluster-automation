@@ -34,12 +34,12 @@ variable "ssh_cidr" {
 
 variable "repo_url" {
   type    = string
-  default = "https://github.com/rvinodrajendran/k8-cluster-automation.git"
+  default = "https://github.com/vjrajendran/k8-cluster-creation"
 }
 
 variable "repo_branch" {
   type    = string
-  default = "main"
+  default = "feature/terraform"
 }
 
 variable "run_deploy" {
