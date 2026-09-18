@@ -1,11 +1,37 @@
 #!/bin/bash
+#
+# Kubernetes cluster deployment.
+#
+# Two modes:
+#   Interactive (default)  : prompts for the PEM key and node IPs (original lab flow).
+#   Non-interactive        : set these env vars and no prompts are shown
+#                            (used by Terraform):
+#       MASTER_IP, CLIENT1_IP, CLIENT2_IP  - private IPs of the nodes
+#       CLUSTER_KEY                        - path to a private key that can
+#                                            already SSH to the workers as ubuntu
 
-set -e
+set -euo pipefail
 
-echo "=========================================="
-echo " Kubernetes Cluster Automation"
-echo "=========================================="
-echo
+cd "$(dirname "$0")"
+
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
+
+if [[ -n "${CLUSTER_KEY:-}" && -n "${MASTER_IP:-}" && -n "${CLIENT1_IP:-}" && -n "${CLIENT2_IP:-}" ]]; then
+    NON_INTERACTIVE=true
+else
+    NON_INTERACTIVE=false
+fi
+
+banner() {
+    echo
+    echo "=========================================="
+    echo " $1"
+    echo "=========================================="
+    echo
+}
+
+banner "Kubernetes Cluster Automation"
+echo "Mode: $([[ "$NON_INTERACTIVE" == true ]] && echo non-interactive || echo interactive)"
 
 # --------------------------------------------------
 # Install Ansible
@@ -14,182 +40,138 @@ echo
 echo "Checking Ansible installation..."
 
 if ! command -v ansible >/dev/null 2>&1; then
-    echo "Ansible is not installed."
-    echo "Installing Ansible..."
-
-    sudo apt update
-    sudo apt install -y ansible
+    echo "Ansible is not installed. Installing..."
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ansible
 else
     echo "Ansible is already installed."
 fi
 
-echo
 ansible --version | head -n 1
 
-# --------------------------------------------------
-# Get PEM key
-# --------------------------------------------------
+if [[ "$NON_INTERACTIVE" == true ]]; then
 
-echo
-echo "=========================================="
-echo " SSH Key Setup"
-echo "=========================================="
-echo
+    # --------------------------------------------------
+    # Non-interactive: key and IPs come from the environment
+    # --------------------------------------------------
 
-PEM_FILE="/tmp/k8s-kodekloud.pem"
+    MASTER_KEY="$CLUSTER_KEY"
+    chmod 600 "$MASTER_KEY"
 
-echo "Paste your complete PEM key below."
-echo "After the final line, type ENDPEM and press Enter."
-echo
+    echo
+    echo "Master1 : $MASTER_IP"
+    echo "Client1 : $CLIENT1_IP"
+    echo "Client2 : $CLIENT2_IP"
 
-rm -f "$PEM_FILE"
+else
 
-while IFS= read -r line
-do
-    if [[ "$line" == "ENDPEM" ]]; then
-        break
+    # --------------------------------------------------
+    # Interactive: get PEM key
+    # --------------------------------------------------
+
+    banner "SSH Key Setup"
+
+    PEM_FILE="/tmp/k8s-kodekloud.pem"
+
+    echo "Paste your complete PEM key below."
+    echo "After the final line, type ENDPEM and press Enter."
+    echo
+
+    rm -f "$PEM_FILE"
+
+    while IFS= read -r line
+    do
+        if [[ "$line" == "ENDPEM" ]]; then
+            break
+        fi
+        echo "$line" >> "$PEM_FILE"
+    done
+
+    chmod 400 "$PEM_FILE"
+    echo
+    echo "PEM key received."
+
+    # --------------------------------------------------
+    # Interactive: get IP addresses
+    # --------------------------------------------------
+
+    banner "Kubernetes Node IPs"
+
+    read -rp "Enter master1 private IP: " MASTER_IP
+    read -rp "Enter client1 private IP: " CLIENT1_IP
+    read -rp "Enter client2 private IP: " CLIENT2_IP
+
+    echo
+    echo "Master1 : $MASTER_IP"
+    echo "Client1 : $CLIENT1_IP"
+    echo "Client2 : $CLIENT2_IP"
+
+    # --------------------------------------------------
+    # Generate SSH key on master
+    # --------------------------------------------------
+
+    banner "Generating Master SSH Key"
+
+    MASTER_KEY="$HOME/.ssh/k8s_cluster_ed25519"
+
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+
+    if [ ! -f "$MASTER_KEY" ]; then
+        ssh-keygen -t ed25519 -f "$MASTER_KEY" -N "" -C "k8s-cluster-master"
+        echo "Master SSH key created."
+    else
+        echo "Master SSH key already exists."
     fi
 
-    echo "$line" >> "$PEM_FILE"
-done
+    # --------------------------------------------------
+    # Configure worker SSH access
+    # --------------------------------------------------
 
-chmod 400 "$PEM_FILE"
+    banner "Configuring Worker SSH Access"
 
-echo
-echo "PEM key received."
+    for ip in "$CLIENT1_IP" "$CLIENT2_IP"; do
+        echo "Connecting to $ip..."
+        ssh -i "$PEM_FILE" "${SSH_OPTS[@]}" "ubuntu@$ip" \
+            'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys' \
+            < "${MASTER_KEY}.pub"
+        echo "✓ $ip SSH access configured."
+    done
 
-# --------------------------------------------------
-# Get IP addresses
-# --------------------------------------------------
-
-echo
-echo "=========================================="
-echo " Kubernetes Node IPs"
-echo "=========================================="
-echo
-
-read -p "Enter master1 private IP: " MASTER_IP
-read -p "Enter client1 private IP: " CLIENT1_IP
-read -p "Enter client2 private IP: " CLIENT2_IP
-
-echo
-echo "Master1 : $MASTER_IP"
-echo "Client1 : $CLIENT1_IP"
-echo "Client2 : $CLIENT2_IP"
-
-# --------------------------------------------------
-# Generate SSH key on master
-# --------------------------------------------------
-
-echo
-echo "=========================================="
-echo " Generating Master SSH Key"
-echo "=========================================="
-echo
-
-MASTER_KEY="$HOME/.ssh/k8s_cluster_ed25519"
-
-mkdir -p "$HOME/.ssh"
-chmod 700 "$HOME/.ssh"
-
-if [ ! -f "$MASTER_KEY" ]; then
-    ssh-keygen \
-        -t ed25519 \
-        -f "$MASTER_KEY" \
-        -N "" \
-        -C "k8s-cluster-master"
-
-    echo "Master SSH key created."
-else
-    echo "Master SSH key already exists."
+    rm -f "$PEM_FILE"
+    echo
+    echo "Temporary PEM file removed."
 fi
 
 # --------------------------------------------------
-# Configure worker SSH access
+# Wait for / test SSH from master to workers
+# (workers may still be booting when Terraform triggers this)
 # --------------------------------------------------
 
-echo
-echo "=========================================="
-echo " Configuring Worker SSH Access"
-echo "=========================================="
-echo
+banner "Testing SSH Connectivity"
 
-echo "Connecting to client1..."
-
-cat "${MASTER_KEY}.pub" | ssh \
-    -i "$PEM_FILE" \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    "ubuntu@$CLIENT1_IP" \
-    'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
-
-echo "✓ client1 SSH access configured."
-
-echo
-echo "Connecting to client2..."
-
-cat "${MASTER_KEY}.pub" | ssh \
-    -i "$PEM_FILE" \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    "ubuntu@$CLIENT2_IP" \
-    'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
-
-echo "✓ client2 SSH access configured."
-
-# --------------------------------------------------
-# Remove temporary PEM
-# --------------------------------------------------
-
-rm -f "$PEM_FILE"
-
-echo
-echo "Temporary PEM file removed."
-
-# --------------------------------------------------
-# Test SSH from master to workers
-# --------------------------------------------------
-
-echo
-echo "=========================================="
-echo " Testing SSH Connectivity"
-echo "=========================================="
-echo
-
-echo "Testing client1..."
-
-ssh \
-    -i "$MASTER_KEY" \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    "ubuntu@$CLIENT1_IP" \
-    "hostname"
-
-echo "✓ client1 SSH working."
-
-echo
-echo "Testing client2..."
-
-ssh \
-    -i "$MASTER_KEY" \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    "ubuntu@$CLIENT2_IP" \
-    "hostname"
-
-echo "✓ client2 SSH working."
+for ip in "$CLIENT1_IP" "$CLIENT2_IP"; do
+    echo "Waiting for $ip..."
+    for attempt in $(seq 1 60); do
+        if ssh -i "$MASTER_KEY" "${SSH_OPTS[@]}" "ubuntu@$ip" "cloud-init status --wait >/dev/null 2>&1 || true; hostname"; then
+            echo "✓ $ip SSH working."
+            break
+        fi
+        if [[ "$attempt" -eq 60 ]]; then
+            echo "✗ Could not reach $ip over SSH after 5 minutes."
+            exit 1
+        fi
+        sleep 5
+    done
+done
 
 # --------------------------------------------------
 # Create Ansible inventory
 # --------------------------------------------------
 
-echo
-echo "=========================================="
-echo " Creating Ansible Inventory"
-echo "=========================================="
-echo
+banner "Creating Ansible Inventory"
 
-cat > inventory.ini <<EOF
+cat > inventory.ini <<INV
 [master]
 master1 ansible_host=$MASTER_IP ansible_connection=local
 
@@ -200,11 +182,7 @@ client2 ansible_host=$CLIENT2_IP ansible_user=ubuntu ansible_ssh_private_key_fil
 [k8s_cluster:children]
 master
 workers
-EOF
-
-echo
-echo "Inventory created:"
-echo
+INV
 
 cat inventory.ini
 
@@ -212,28 +190,15 @@ cat inventory.ini
 # Test Ansible connectivity
 # --------------------------------------------------
 
-echo
-echo "=========================================="
-echo " Testing Ansible Connectivity"
-echo "=========================================="
-echo
+banner "Testing Ansible Connectivity"
 
 ansible all -m ping
-
-echo
-echo "=========================================="
-echo " Ansible Connectivity Successful!"
-echo "=========================================="
 
 # --------------------------------------------------
 # Deploy Kubernetes
 # --------------------------------------------------
 
-echo
-echo "=========================================="
-echo " Starting Kubernetes Deployment"
-echo "=========================================="
-echo
+banner "Starting Kubernetes Deployment"
 
 ansible-playbook site.yml
 
@@ -241,16 +206,11 @@ ansible-playbook site.yml
 # Final cluster status
 # --------------------------------------------------
 
-echo
-echo "=========================================="
-echo " Kubernetes Cluster Status"
-echo "=========================================="
-echo
+banner "Kubernetes Cluster Status"
 
+# Workers take a few seconds to go Ready after Flannel starts
+export KUBECONFIG="$HOME/.kube/config"
+kubectl wait --for=condition=Ready nodes --all --timeout=180s || true
 kubectl get nodes -o wide
 
-echo
-echo "=========================================="
-echo " Kubernetes Cluster Ready!"
-echo "=========================================="
-echo
+banner "Kubernetes Cluster Ready!"
